@@ -386,6 +386,9 @@ class StaticKVCache:
         end = pos + T
         if end > self.max_seq_len:
             raise ValueError(f"KV cache capacity {self.max_seq_len} exceeded by {end}; generation was not shortened")
+        if self.key_cache[layer_idx].device != key_states.device:
+            self.key_cache[layer_idx] = self.key_cache[layer_idx].to(key_states.device)
+            self.value_cache[layer_idx] = self.value_cache[layer_idx].to(value_states.device)
         self.key_cache[layer_idx][:, :, pos:end] = key_states
         self.value_cache[layer_idx][:, :, pos:end] = value_states
         if layer_idx == self.num_layers - 1:

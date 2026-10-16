@@ -67,7 +67,16 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     if query_chunk_size is not None and (isinstance(query_chunk_size, bool) or
                                         not isinstance(query_chunk_size, Integral) or query_chunk_size < 1):
         raise ValueError("query_chunk_size must be a positive integer")
-    block = query_chunk_size or (len(q) if q.device.type == "cuda" and backend != "math" else 256)
+    if query_chunk_size is not None:
+        block = query_chunk_size
+    elif q.device.type == "cuda" and backend != "math":
+        try:
+            total_gib = torch.cuda.get_device_properties(q.device).total_memory / (1024 ** 3)
+            block = 512 if total_gib < 18.0 else len(q)
+        except Exception:
+            block = 512
+    else:
+        block = 256
     query = q.transpose(0, 1).unsqueeze(0)
     key = k.transpose(0, 1).unsqueeze(0)
     value = v.transpose(0, 1).unsqueeze(0)
@@ -137,7 +146,12 @@ class CachedNAR:
         cos, sin = backbone.rotary_emb(positions)
         x = backbone.embed_tokens(ids)
         for layer in backbone.layers:
-            q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos, sin)
+            layer_dev = next(layer.parameters()).device
+            if x.device != layer_dev:
+                x = x.to(layer_dev)
+            cos_l = cos.to(layer_dev) if cos.device != layer_dev else cos
+            sin_l = sin.to(layer_dev) if sin.device != layer_dev else sin
+            q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos_l, sin_l)
             # Clone only for restricted visibility; a slice would retain the
             # storage of invisible codec tokens for every layer.
             cached = (k[0, :self.visible_length], v[0, :self.visible_length])
@@ -159,12 +173,28 @@ class CachedNAR:
         x = x + model.time_embedder(shifted.expand(self.nar_length))[None]
         x = x + self.pos_emb
         for layer, (ar_k, ar_v) in zip(model.model.layers, self.cache):
-            q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), self.cos, self.sin)
+            layer_dev = next(layer.parameters()).device
+            if x.device != layer_dev:
+                x = x.to(layer_dev)
+            cos_l = self.cos.to(layer_dev) if self.cos.device != layer_dev else self.cos
+            sin_l = self.sin.to(layer_dev) if self.sin.device != layer_dev else self.sin
+            q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), cos_l, sin_l)
+            if ar_k.device != layer_dev:
+                ar_k = ar_k.to(layer_dev)
+            if ar_v.device != layer_dev:
+                ar_v = ar_v.to(layer_dev)
             k, v = torch.cat((ar_k, k[0])), torch.cat((ar_v, v[0]))
             h = self._attention(q[0], k, v)
             x = x + layer.nar_self_attn.o_proj(h.flatten(1)[None])
             x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
-        return model.llm2vae(model.model.norm(x))[0, 1:-1]
+        norm_dev = next(model.model.norm.parameters()).device
+        if x.device != norm_dev:
+            x = x.to(norm_dev)
+        llm2vae_dev = next(model.llm2vae.parameters()).device
+        normed = model.model.norm(x)
+        if normed.device != llm2vae_dev:
+            normed = normed.to(llm2vae_dev)
+        return model.llm2vae(normed)[0, 1:-1]
 
     @torch.inference_mode()
     def solve(self, steps=32, cancelled: Callable[[], bool] | None = None,
@@ -240,6 +270,15 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
     """
     if model.training:
         raise ValueError("synthesize requires model.eval()")
+    if query_chunk_size is None:
+        try:
+            param = next(model.parameters(), None)
+            if param is not None and param.device.type == "cuda":
+                total_gib = torch.cuda.get_device_properties(param.device).total_memory / (1024 ** 3)
+                if total_gib < 18.0:
+                    query_chunk_size = 512
+        except Exception:
+            pass
     chunks = song_chunks(prefix, codec, seed, context)
     output = []
     for chunk_index, chunk in enumerate(chunks):

@@ -32,6 +32,7 @@ def get_pipe(args):
     return YuE2Pipeline.from_pretrained(model, vae=vae, revision=args.revision,
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
+             multi_gpu=getattr(args, "multi_gpu", False),
              local_files_only=args.offline, generation_config=config,
              vae_core_frames=512 if args.budget <= 14 else None,
              progress=not getattr(args, "quiet", False))
@@ -197,6 +198,7 @@ def parser():
         q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
         q.add_argument("--quantization", choices=("none", "fp8"), default="none")
         q.add_argument("--offload-ar", action="store_true")
+        q.add_argument("--multi-gpu", action="store_true", help="Distribute model across multiple GPUs (e.g. dual T4)")
         q.add_argument("--offline", action="store_true")
         q.add_argument("--config")
         q.add_argument("--output")

@@ -122,7 +122,8 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 multi_gpu=False):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -137,6 +138,11 @@ class YuE2Pipeline:
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
+        self.multi_gpu = bool(multi_gpu or (self.device.type == "cuda" and torch.cuda.device_count() > 1))
+        if self.multi_gpu and self.device.type == "cuda" and torch.cuda.device_count() > 1:
+            self.vae_device = torch.device("cuda:1")
+        else:
+            self.vae_device = self.device
         self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(memory_budget_gib, offload_ar)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -155,7 +161,7 @@ class YuE2Pipeline:
         self.runtime_sha256 = identity({p.name: sha256_file(p) for p in sorted(Path(__file__).parent.glob("*.py"))})
         self._model, self._vae = None, None
         self.load_timing = {}
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and not self.multi_gpu:
             total = torch.cuda.get_device_properties(self.device).total_memory
             budget = min((self.memory_budget_gib - 2) * 2**30, total - 2 * 2**30)
             if budget <= 0:
@@ -192,7 +198,7 @@ class YuE2Pipeline:
     @classmethod
     def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
                         revision=None, vae_revision=None, local_files_only=False,
-                        token=None, cache_dir=None, progress=True, **kwargs):
+                        token=None, cache_dir=None, progress=True, multi_gpu=False, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
@@ -209,7 +215,7 @@ class YuE2Pipeline:
         with Progress(enabled=progress).stage("Resolving model files"):
             model_path = resolve_model(model, revision=revision, **hub)
             vae_path = resolve_model(vae, revision=vae_revision, **hub)
-        result = cls(model_path, vae_path, progress=progress, **kwargs)
+        result = cls(model_path, vae_path, progress=progress, multi_gpu=multi_gpu, **kwargs)
         result.load_timing["resolve_and_integrity_seconds"] = time.perf_counter() - start
         return result
 
@@ -233,18 +239,28 @@ class YuE2Pipeline:
                    "generation_config": self.generation_config.to_dict(), "source_weights": self.weights})
 
     def _load_model(self, for_nar=False):
-        loading = self._model is None or next(self._model.parameters()).device != self.device
+        loading = self._model is None or (not self.multi_gpu and next(self._model.parameters()).device != self.device)
         with self._status("Loading model") if loading else nullcontext():
             if self._model is None:
                 from .modeling_yue2 import YuE2ForCausalLM
                 start = time.perf_counter()
-                self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
-                              torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+                if self.multi_gpu and self.device.type == "cuda" and torch.cuda.device_count() > 1:
+                    self._model = YuE2ForCausalLM.from_pretrained(
+                        self.model_dir, local_files_only=True,
+                        torch_dtype=torch.bfloat16, device_map="auto"
+                    ).eval()
+                else:
+                    self._model = YuE2ForCausalLM.from_pretrained(
+                        self.model_dir, local_files_only=True,
+                        torch_dtype=torch.bfloat16, low_cpu_mem_usage=True
+                    ).eval()
+                    self._model.to(self.device)
                 self.load_timing["mot_load_seconds"] = time.perf_counter() - start
             if self.quantization == "fp8" and not for_nar:
                 from .quantization import prepare_fp8_ar
                 prepare_fp8_ar(self._model, self.device)
-            self._model.to(self.device)
+            if not self.multi_gpu:
+                self._model.to(self.device)
         return self._model
 
     def _request(self, style=None, lyrics=None, *, tags=None, **kwargs):
@@ -344,18 +360,19 @@ class YuE2Pipeline:
 
     def decode(self, latents, *, full=False, vae=None):
         from .modeling_vae import YuE2VAE
+        target_device = self.vae_device
         with self._status("Loading audio decoder"):
-            if self._model is not None:
+            if not self.multi_gpu and self._model is not None:
                 self._model.to("cpu")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             if vae is not None:
-                model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=self.device)
+                model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=target_device)
             else:
                 if self._vae is None:
-                    self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True, device="cpu",
+                    self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True, device=target_device,
                                                         local_files_only=True)
-                model = self._vae.to(self.device)
+                model = self._vae.to(target_device)
         z = torch.as_tensor(latents, dtype=torch.float32)
         if z.ndim == 2 and z.shape[1] == 64:
             z = z.T.unsqueeze(0)
@@ -367,16 +384,17 @@ class YuE2Pipeline:
                 report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
                 with torch.inference_mode():
                     if full:
-                        audio = model.decode(z.to(self.device)).cpu()
+                        audio = model.decode(z.to(target_device)).cpu()
                         status.update(1)
                     else:
-                        audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=16,
+                        audio = model.decode_tiled(z.to(target_device), core_frames=self.vae_core_frames, halo_frames=16,
                                                    output_device="cpu", on_progress=report)
                 if not torch.isfinite(audio).all():
                     raise ValueError("VAE produced non-finite audio")
                 return audio[0].float().clamp(-1, 1).T.contiguous().numpy()
         finally:
-            model.to("cpu")
+            if not self.multi_gpu:
+                model.to("cpu")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -396,7 +414,8 @@ class YuE2Pipeline:
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
                 "vae_core_frames": self.vae_core_frames, "vae_halo_frames": 16,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
-                "offload_ar": self.offload_ar, "runtime_sha256": self.runtime_sha256,
+                "offload_ar": self.offload_ar, "multi_gpu": self.multi_gpu,
+                "vae_device": str(self.vae_device), "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),
                 "validation_status": "unvalidated"}
 

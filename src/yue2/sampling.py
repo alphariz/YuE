@@ -83,7 +83,8 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
 
     graph = None
     positive_cache = negative_cache = None
-    graph_enabled = use_cuda_graph and device.type == "cuda" and not getattr(model, "_yue2_fp8_originals", {})
+    is_multi_device = hasattr(model, "hf_device_map") and len({str(v) for v in model.hf_device_map.values() if v not in ("cpu", "disk")}) > 1
+    graph_enabled = use_cuda_graph and device.type == "cuda" and not is_multi_device and not getattr(model, "_yue2_fp8_originals", {})
     synchronize(device)
     start = time.perf_counter()
     try:
@@ -131,10 +132,11 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
                     conditional = branch_logits[:1]
                     unconditional = branch_logits[1:] if cfg_scale != 1 else None
                 else:
-                    conditional = model(next_id, past_key_values=positive_cache, use_cache=True,
+                    input_id = next_id.to(device)
+                    conditional = model(input_id, past_key_values=positive_cache, use_cache=True,
                                         logits_to_keep=1).logits[:, -1, :]
                     if negative_cache is not None:
-                        unconditional = model(next_id, past_key_values=negative_cache, use_cache=True,
+                        unconditional = model(input_id, past_key_values=negative_cache, use_cache=True,
                                               logits_to_keep=1).logits[:, -1, :]
         synchronize(device)
         seconds = time.perf_counter() - start
