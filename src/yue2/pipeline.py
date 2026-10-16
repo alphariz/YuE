@@ -6,6 +6,7 @@ from pathlib import Path
 import dataclasses
 import json
 import time
+import warnings
 import numpy as np
 import torch
 
@@ -136,6 +137,7 @@ class YuE2Pipeline:
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
+        self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(memory_budget_gib, offload_ar)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -144,9 +146,7 @@ class YuE2Pipeline:
         torch.set_float32_matmul_precision("highest")
         self.model_dir, self.vae_dir = Path(model_dir), Path(vae_dir)
         self.backend, self.quantization = backend, quantization
-        self.memory_budget_gib = float(memory_budget_gib)
-        self.vae_core_frames = vae_core_frames if vae_core_frames is not None else (512 if memory_budget_gib <= 12 else 1024)
-        self.offload_ar = offload_ar
+        self.vae_core_frames = vae_core_frames if vae_core_frames is not None else (512 if self.memory_budget_gib <= 14 else 1024)
         self.generation_config = generation_config or GenerationConfig()
         self.tokenizer = YuE2TextTokenizer(self.model_dir / "qwen.tiktoken")
         with self._status("Verifying model files"):
@@ -156,13 +156,38 @@ class YuE2Pipeline:
         self._model, self._vae = None, None
         self.load_timing = {}
         if self.device.type == "cuda":
-            if not torch.cuda.is_bf16_supported():
-                raise RuntimeError("The unquantized preset requires CUDA BF16 support")
             total = torch.cuda.get_device_properties(self.device).total_memory
             budget = min((self.memory_budget_gib - 2) * 2**30, total - 2 * 2**30)
             if budget <= 0:
                 raise ValueError("Memory budget must leave room for a 2GiB reserve")
             torch.cuda.set_per_process_memory_fraction(min(budget / total, 1), self.device)
+
+    def _auto_configure_kaggle_hardware(self, memory_budget_gib: float, offload_ar: bool) -> tuple[float, bool]:
+        """Auto-configure hardware parameters for constrained environments like Kaggle (T4/P100)."""
+        if self.device.type != "cuda":
+            return float(memory_budget_gib), bool(offload_ar)
+
+        props = torch.cuda.get_device_properties(self.device)
+        total_gib = props.total_memory / (1024 ** 3)
+
+        # Detect total physical VRAM: If <= 18 GB (e.g. Tesla T4 / P100 16 GB Kaggle)
+        if total_gib <= 18.0:
+            if not offload_ar:
+                offload_ar = True
+            if memory_budget_gib > 13.0:
+                memory_budget_gib = 13.0
+
+        # Check BF16 support: emit non-fatal warning instead of raising RuntimeError
+        if not torch.cuda.is_bf16_supported():
+            warnings.warn(
+                f"GPU {props.name} (Compute Capability {props.major}.{props.minor}) does not have native "
+                "BF16 hardware acceleration. Continuing with software/emulated support. "
+                "Inference will proceed, but for optimal performance consider an Ampere or newer GPU.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return float(memory_budget_gib), bool(offload_ar)
 
     @classmethod
     def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",

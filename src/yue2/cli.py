@@ -33,7 +33,7 @@ def get_pipe(args):
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar,
              local_files_only=args.offline, generation_config=config,
-             vae_core_frames=512 if args.budget <= 12 else 1024,
+             vae_core_frames=512 if args.budget <= 14 else None,
              progress=not getattr(args, "quiet", False))
 
 

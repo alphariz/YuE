@@ -139,14 +139,23 @@ class GraphAR:
             # All allocated slots are present, but only each branch's completed
             # prefix and the current token are visible. Future slots never leak.
             if self.attention_backend == "flash":
-                # seqused_k is respected by the 3D packed/varlen entrypoint.
-                # The 4D fixed-batch entrypoint ignores it in torch 2.10, so do
-                # not replace this call with an apparently equivalent 4D call.
-                h = torch.ops.aten._flash_attention_forward(
-                    q[:, 0], keys.view(-1, config.num_key_value_heads, config.head_dim),
-                    values.view(-1, config.num_key_value_heads, config.head_dim),
-                    self.cu_q, self.cu_k, 1, self.capacity, 0.0, False, False,
-                    seqused_k=used_lengths)[0][:, None]
+                try:
+                    # seqused_k is respected by the 3D packed/varlen entrypoint.
+                    # The 4D fixed-batch entrypoint ignores it in torch 2.10, so do
+                    # not replace this call with an apparently equivalent 4D call.
+                    h = torch.ops.aten._flash_attention_forward(
+                        q[:, 0], keys.view(-1, config.num_key_value_heads, config.head_dim),
+                        values.view(-1, config.num_key_value_heads, config.head_dim),
+                        self.cu_q, self.cu_k, 1, self.capacity, 0.0, False, False,
+                        seqused_k=used_lengths)[0][:, None]
+                except (AttributeError, RuntimeError):
+                    if visible is None:
+                        visible = (self.key_positions[None, :] <= self.positions[:, None])[:, None, None, :]
+                    h = F.scaled_dot_product_attention(
+                        q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
+                        attn_mask=visible, is_causal=False,
+                        enable_gqa=config.num_attention_heads != config.num_key_value_heads
+                    ).transpose(1, 2)
             elif self.attention_backend == "cudnn":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
