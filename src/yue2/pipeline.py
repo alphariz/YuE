@@ -133,8 +133,8 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
-                 multi_gpu=False):
+                 vae_core_frames=None, quantization="none", offload_ar=None, progress=True,
+                 multi_gpu=None):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -149,12 +149,20 @@ class YuE2Pipeline:
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self.multi_gpu = bool(multi_gpu or (self.device.type == "cuda" and torch.cuda.device_count() > 1))
-        if self.multi_gpu and self.device.type == "cuda" and torch.cuda.device_count() > 1:
-            self.vae_device = torch.device("cuda:1")
+
+        gpu_count = torch.cuda.device_count() if (self.device.type == "cuda" and torch.cuda.is_available()) else 0
+        if multi_gpu is None:
+            self.multi_gpu = bool(gpu_count > 1)
+        else:
+            self.multi_gpu = bool(multi_gpu and gpu_count > 1)
+
+        if self.multi_gpu and gpu_count > 1:
+            self.vae_device = torch.device(f"cuda:{gpu_count - 1}")
         else:
             self.vae_device = self.device
-        self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(memory_budget_gib, offload_ar)
+        self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(
+            memory_budget_gib, offload_ar, gpu_count=gpu_count
+        )
         # Limit CPU threads to avoid context-switching overhead on Kaggle (2-4 vCPUs)
         torch.set_num_threads(min(4, os.cpu_count() or 1))
         torch.backends.cudnn.benchmark = False
@@ -181,20 +189,33 @@ class YuE2Pipeline:
                 raise ValueError("Memory budget must leave room for a 2GiB reserve")
             torch.cuda.set_per_process_memory_fraction(min(budget / total, 1), self.device)
 
-    def _auto_configure_kaggle_hardware(self, memory_budget_gib: float, offload_ar: bool) -> tuple[float, bool]:
+    def _auto_configure_kaggle_hardware(
+        self, memory_budget_gib: float, offload_ar: bool | None, gpu_count: int | None = None
+    ) -> tuple[float, bool]:
         """Auto-configure hardware parameters for constrained environments like Kaggle (T4/P100)."""
         if self.device.type != "cuda":
-            return float(memory_budget_gib), bool(offload_ar)
+            return float(memory_budget_gib), bool(offload_ar if offload_ar is not None else False)
+
+        if gpu_count is None:
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
         props = torch.cuda.get_device_properties(self.device)
         total_gib = props.total_memory / (1024 ** 3)
 
-        # Detect total physical VRAM: If <= 18 GB (e.g. Tesla T4 / P100 16 GB Kaggle)
-        if total_gib <= 18.0:
-            if not offload_ar:
+        # Smart Offload logic based on detected GPU count:
+        if gpu_count <= 1:
+            # Single-GPU Mode (e.g. Tesla T4 x 1 / Colab):
+            # Run fully on cuda:0; default offload_ar=False to eliminate CPU-GPU race conditions.
+            if offload_ar is None:
+                offload_ar = False
+        else:
+            # Multi-GPU Mode (e.g. Kaggle Dual T4 x 2):
+            # Distribute layers across GPUs and enable smart offload.
+            if offload_ar is None:
                 offload_ar = True
-            if memory_budget_gib > 13.0:
-                memory_budget_gib = 13.0
+
+        if total_gib <= 18.0 and memory_budget_gib > 13.0:
+            memory_budget_gib = 13.0
 
         # Check BF16 support: emit non-fatal warning instead of raising RuntimeError
         if not torch.cuda.is_bf16_supported():
@@ -211,7 +232,7 @@ class YuE2Pipeline:
     @classmethod
     def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
                         revision=None, vae_revision=None, local_files_only=False,
-                        token=None, cache_dir=None, progress=True, multi_gpu=False, **kwargs):
+                        token=None, cache_dir=None, progress=True, multi_gpu=None, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")

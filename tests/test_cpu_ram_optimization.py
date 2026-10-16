@@ -593,6 +593,59 @@ class TestPipelineSourceStructure(unittest.TestCase):
 
 
 # ===========================================================================
+# TEST 10: SMART DEVICE MANAGEMENT & MULTI-GPU AUTO-ROUTING
+# ===========================================================================
+
+class TestSmartDeviceManagementAndRouting(unittest.TestCase):
+    """Verify single-GPU fallback (offload_ar=False) and multi-GPU auto-routing."""
+
+    def test_single_gpu_smart_offload_fallback(self):
+        """Simulate device_count=1: multi_gpu=False, offload_ar=False, runs on cuda:0."""
+        mock_props = MagicMock(total_memory=16 * (1024 ** 3), name="Tesla T4", major=7, minor=5)
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.device_count", return_value=1),
+            patch("torch.cuda.get_device_properties", return_value=mock_props),
+            patch("torch.cuda.is_bf16_supported", return_value=False),
+            patch.object(Path, "is_file", return_value=True),
+            patch("yue2.pipeline.model_identity", return_value="mock_hash"),
+            patch("yue2.pipeline.YuE2TextTokenizer", return_value=MagicMock()),
+            patch("torch.cuda.set_per_process_memory_fraction"),
+        ):
+            pipe = YuE2Pipeline("/fake/model", "/fake/vae", device="cuda:0")
+            assert pipe.multi_gpu is False, "Single GPU must not enable multi_gpu"
+            assert pipe.offload_ar is False, "Single GPU must default offload_ar=False to eliminate race conditions"
+            assert pipe.vae_device == torch.device("cuda:0"), "Single GPU must allocate VAE on cuda:0"
+
+    def test_multi_gpu_auto_routing(self):
+        """Simulate device_count=2: multi_gpu=True, offload_ar=True, VAE on cuda:1."""
+        mock_props = MagicMock(total_memory=16 * (1024 ** 3), name="Tesla T4", major=7, minor=5)
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.device_count", return_value=2),
+            patch("torch.cuda.get_device_properties", return_value=mock_props),
+            patch("torch.cuda.is_bf16_supported", return_value=False),
+            patch.object(Path, "is_file", return_value=True),
+            patch("yue2.pipeline.model_identity", return_value="mock_hash"),
+            patch("yue2.pipeline.YuE2TextTokenizer", return_value=MagicMock()),
+            patch("torch.cuda.set_per_process_memory_fraction"),
+        ):
+            pipe = YuE2Pipeline("/fake/model", "/fake/vae", device="cuda:0")
+            assert pipe.multi_gpu is True, "Dual GPU must automatically enable multi_gpu"
+            assert pipe.offload_ar is True, "Dual GPU must enable offload_ar"
+            assert pipe.vae_device == torch.device("cuda:1"), "Dual GPU must allocate VAE on GPU 1 (cuda:1)"
+
+    def test_sync_device_called_in_nar_velocity_and_prefill(self):
+        """nar.py must call _sync_device before project_qkv and torch.cat."""
+        import inspect
+        prefill_src = inspect.getsource(nar.CachedNAR._prefill)
+        velocity_src = inspect.getsource(nar.CachedNAR.velocity)
+        assert "_sync_device(layer_dev)" in prefill_src
+        assert "_sync_device(layer_dev)" in velocity_src
+        assert "_sync_device(llm2vae_dev)" in velocity_src
+
+
+# ===========================================================================
 # RUNNER
 # ===========================================================================
 
@@ -616,6 +669,7 @@ if __name__ == "__main__":
             TestAttentionRegression,
             TestSongResultProperties,
             TestPipelineSourceStructure,
+            TestSmartDeviceManagementAndRouting,
         ]:
             suite.addTests(loader.loadTestsFromTestCase(cls))
         runner = unittest.TextTestRunner(verbosity=2)

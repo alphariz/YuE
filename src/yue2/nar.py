@@ -108,6 +108,11 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
     return torch.cat(outputs, dim=-2)[0].transpose(0, 1)
 
 
+def _sync_device(device):
+    if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
+        torch.cuda.current_stream(device).synchronize()
+
+
 class CachedNAR:
     """One original acoustic chunk; AR prefix KV is invariant during the ODE."""
 
@@ -155,6 +160,7 @@ class CachedNAR:
                 cos_l = cos_l.to(x.device)
             if sin_l.device != x.device:
                 sin_l = sin_l.to(x.device)
+            _sync_device(layer_dev)
             q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos_l, sin_l)
             # Clone only for restricted visibility; a slice would retain the
             # storage of invisible codec tokens for every layer.
@@ -186,11 +192,17 @@ class CachedNAR:
                 cos_l = cos_l.to(x.device)
             if sin_l.device != x.device:
                 sin_l = sin_l.to(x.device)
+            _sync_device(layer_dev)
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), cos_l, sin_l)
             if ar_k.device != layer_dev:
                 ar_k = ar_k.to(layer_dev, non_blocking=True)
             if ar_v.device != layer_dev:
                 ar_v = ar_v.to(layer_dev, non_blocking=True)
+            if ar_k.device != k[0].device:
+                ar_k = ar_k.to(k[0].device)
+            if ar_v.device != v[0].device:
+                ar_v = ar_v.to(v[0].device)
+            _sync_device(layer_dev)
             k, v = torch.cat((ar_k, k[0])), torch.cat((ar_v, v[0]))
             h = self._attention(q[0], k, v)
             x = x + layer.nar_self_attn.o_proj(h.flatten(1)[None])
@@ -199,9 +211,11 @@ class CachedNAR:
         if x.device != norm_dev:
             x = x.to(norm_dev, non_blocking=True)
         llm2vae_dev = next(model.llm2vae.parameters()).device
+        _sync_device(norm_dev)
         normed = model.model.norm(x)
         if normed.device != llm2vae_dev:
             normed = normed.to(llm2vae_dev, non_blocking=True)
+        _sync_device(llm2vae_dev)
         return model.llm2vae(normed)[0, 1:-1]
 
     @torch.inference_mode()
