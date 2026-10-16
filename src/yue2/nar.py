@@ -182,10 +182,15 @@ class CachedNAR:
         x = model.vae2llm(x_nar[None])
         x = x + model.time_embedder(shifted.expand(self.nar_length))[None]
         x = x + self.pos_emb
-        for layer, (ar_k, ar_v) in zip(model.model.layers, self.cache):
+        for layer_idx, layer in enumerate(model.model.layers):
             layer_dev = next(layer.parameters()).device
             if x.device != layer_dev:
-                x = x.to(layer_dev, non_blocking=True)
+                x = x.to(layer_dev)
+            ar_k, ar_v = self.cache[layer_idx]
+            if ar_k.device != layer_dev:
+                ar_k = ar_k.to(layer_dev)
+            if ar_v.device != layer_dev:
+                ar_v = ar_v.to(layer_dev)
             cos_l = self.cos.to(layer_dev, non_blocking=True) if self.cos.device != layer_dev else self.cos
             sin_l = self.sin.to(layer_dev, non_blocking=True) if self.sin.device != layer_dev else self.sin
             if cos_l.device != x.device:
@@ -194,10 +199,6 @@ class CachedNAR:
                 sin_l = sin_l.to(x.device)
             _sync_device(layer_dev)
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), cos_l, sin_l)
-            if ar_k.device != layer_dev:
-                ar_k = ar_k.to(layer_dev, non_blocking=True)
-            if ar_v.device != layer_dev:
-                ar_v = ar_v.to(layer_dev, non_blocking=True)
             if ar_k.device != k[0].device:
                 ar_k = ar_k.to(k[0].device)
             if ar_v.device != v[0].device:
@@ -205,8 +206,16 @@ class CachedNAR:
             _sync_device(layer_dev)
             k, v = torch.cat((ar_k, k[0])), torch.cat((ar_v, v[0]))
             h = self._attention(q[0], k, v)
-            x = x + layer.nar_self_attn.o_proj(h.flatten(1)[None])
-            x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
+            if h.device != layer_dev:
+                h = h.to(layer_dev)
+            attn_out = layer.nar_self_attn.o_proj(h.flatten(1)[None])
+            if attn_out.device != x.device:
+                attn_out = attn_out.to(x.device)
+            x = x + attn_out
+            mlp_out = layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
+            if mlp_out.device != x.device:
+                mlp_out = mlp_out.to(x.device)
+            x = x + mlp_out
         norm_dev = next(model.model.norm.parameters()).device
         if x.device != norm_dev:
             x = x.to(norm_dev, non_blocking=True)

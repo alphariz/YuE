@@ -384,15 +384,17 @@ class TestNonBlockingTransfers(unittest.TestCase):
         )
 
     def test_velocity_uses_non_blocking(self):
-        """velocity cross-device transfers must use non_blocking=True."""
+        """velocity must use non_blocking for norm/llm2vae and explicit layer_dev alignment."""
         import inspect
         source = inspect.getsource(nar.CachedNAR.velocity)
-        lines_with_to = [line.strip() for line in source.split("\n")
-                         if ".to(layer_dev" in line or ".to(norm_dev" in line
-                         or ".to(llm2vae_dev" in line]
-        missing = [l for l in lines_with_to if "non_blocking" not in l]
-        assert len(missing) == 0, (
-            f"Found .to() without non_blocking in velocity: {missing}"
+        assert "x = x.to(layer_dev)" in source
+        assert "ar_k = ar_k.to(layer_dev)" in source
+        assert "ar_v = ar_v.to(layer_dev)" in source
+        assert ".to(norm_dev, non_blocking=True)" in source
+        assert ".to(llm2vae_dev, non_blocking=True)" in source
+        assert "attn_out = layer.nar_self_attn.o_proj" in source
+        assert "if attn_out.device != x.device: attn_out = attn_out.to(x.device)" in source or (
+            "if attn_out.device != x.device:\n                attn_out = attn_out.to(x.device)" in source
         )
 
     def test_solve_noise_transfer_non_blocking(self):
