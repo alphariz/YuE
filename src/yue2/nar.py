@@ -148,9 +148,9 @@ class CachedNAR:
         for layer in backbone.layers:
             layer_dev = next(layer.parameters()).device
             if x.device != layer_dev:
-                x = x.to(layer_dev)
-            cos_l = cos.to(layer_dev) if cos.device != layer_dev else cos
-            sin_l = sin.to(layer_dev) if sin.device != layer_dev else sin
+                x = x.to(layer_dev, non_blocking=True)
+            cos_l = cos.to(layer_dev, non_blocking=True) if cos.device != layer_dev else cos
+            sin_l = sin.to(layer_dev, non_blocking=True) if sin.device != layer_dev else sin
             q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos_l, sin_l)
             # Clone only for restricted visibility; a slice would retain the
             # storage of invisible codec tokens for every layer.
@@ -175,25 +175,25 @@ class CachedNAR:
         for layer, (ar_k, ar_v) in zip(model.model.layers, self.cache):
             layer_dev = next(layer.parameters()).device
             if x.device != layer_dev:
-                x = x.to(layer_dev)
-            cos_l = self.cos.to(layer_dev) if self.cos.device != layer_dev else self.cos
-            sin_l = self.sin.to(layer_dev) if self.sin.device != layer_dev else self.sin
+                x = x.to(layer_dev, non_blocking=True)
+            cos_l = self.cos.to(layer_dev, non_blocking=True) if self.cos.device != layer_dev else self.cos
+            sin_l = self.sin.to(layer_dev, non_blocking=True) if self.sin.device != layer_dev else self.sin
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), cos_l, sin_l)
             if ar_k.device != layer_dev:
-                ar_k = ar_k.to(layer_dev)
+                ar_k = ar_k.to(layer_dev, non_blocking=True)
             if ar_v.device != layer_dev:
-                ar_v = ar_v.to(layer_dev)
+                ar_v = ar_v.to(layer_dev, non_blocking=True)
             k, v = torch.cat((ar_k, k[0])), torch.cat((ar_v, v[0]))
             h = self._attention(q[0], k, v)
             x = x + layer.nar_self_attn.o_proj(h.flatten(1)[None])
             x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
         norm_dev = next(model.model.norm.parameters()).device
         if x.device != norm_dev:
-            x = x.to(norm_dev)
+            x = x.to(norm_dev, non_blocking=True)
         llm2vae_dev = next(model.llm2vae.parameters()).device
         normed = model.model.norm(x)
         if normed.device != llm2vae_dev:
-            normed = normed.to(llm2vae_dev)
+            normed = normed.to(llm2vae_dev, non_blocking=True)
         return model.llm2vae(normed)[0, 1:-1]
 
     @torch.inference_mode()
@@ -207,7 +207,7 @@ class CachedNAR:
         """
         if isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 1:
             raise ValueError("steps must be a positive integer")
-        state = self.chunk.noise.to(device=self.device, dtype=self.dtype)
+        state = self.chunk.noise.to(device=self.device, dtype=self.dtype, non_blocking=True)
         dt = 1.0 / steps
         for step in range(steps):
             if cancelled is not None and cancelled():
@@ -244,14 +244,19 @@ def _offload_ar(model, enabled):
             for module in modules:
                 device = next(module.parameters()).device
                 if device.type != "cpu":
-                    module.to(device="cpu")
+                    module.to(device="cpu", non_blocking=True)
                     moved.append((module, device))
+            # Synchronize before proceeding to ensure all transfers complete
             if torch.cuda.is_available():
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         yield
     finally:
         for module, device in moved:
-            module.to(device=device)
+            module.to(device=device, non_blocking=True)
+        # Synchronize after restore to ensure weights are on-device before use
+        if moved and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
 
 @torch.inference_mode()

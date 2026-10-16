@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import dataclasses
+import gc
 import json
+import os
 import time
 import warnings
 import numpy as np
@@ -101,13 +103,22 @@ class SongResult:
         sf.write(path, self.audio, self.sample_rate, subtype="PCM_24" if path.suffix.lower() == ".flac" else "FLOAT")
         return str(path)
 
-    def save_artifacts(self, directory):
+    def save_artifacts(self, directory, *, audio_chunk_samples=480000):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self.semantic.plan.save(directory)
         self.save(directory / "audio.flac")
         np.save(directory / "semantic.npy", np.asarray(self.semantic.tokens, dtype=np.int32))
-        np.save(directory / "latent.npy", self.latents.astype(np.float32))
+        # Chunked float32 conversion to avoid 2-3x RAM spike on long audio
+        latents = self.latents
+        if latents.dtype != np.float32:
+            total = latents.shape[0]
+            chunk = max(total // 4, 1)
+            parts = []
+            for i in range(0, total, chunk):
+                parts.append(latents[i:i + chunk].astype(np.float32))
+            latents = np.concatenate(parts)
+        np.save(directory / "latent.npy", latents)
         write_json(directory / "request.json", self.semantic.plan.request.to_dict())
         write_json(directory / "config.json", self.config)
         result = {"status": "complete", "identity": self.request_identity,
@@ -144,6 +155,8 @@ class YuE2Pipeline:
         else:
             self.vae_device = self.device
         self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(memory_budget_gib, offload_ar)
+        # Limit CPU threads to avoid context-switching overhead on Kaggle (2-4 vCPUs)
+        torch.set_num_threads(min(4, os.cpu_count() or 1))
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -247,7 +260,8 @@ class YuE2Pipeline:
                 if self.multi_gpu and self.device.type == "cuda" and torch.cuda.device_count() > 1:
                     self._model = YuE2ForCausalLM.from_pretrained(
                         self.model_dir, local_files_only=True,
-                        torch_dtype=torch.bfloat16, device_map="auto"
+                        torch_dtype=torch.bfloat16, device_map="auto",
+                        low_cpu_mem_usage=True
                     ).eval()
                 else:
                     self._model = YuE2ForCausalLM.from_pretrained(
@@ -397,6 +411,8 @@ class YuE2Pipeline:
                 model.to("cpu")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+            # Free VAE host memory after decode completes
+            gc.collect()
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
         config = self.generation_config.to_dict()
