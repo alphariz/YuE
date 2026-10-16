@@ -150,6 +150,10 @@ class RotaryEmbedding(nn.Module):
 
 
 def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    if cos.device != x.device:
+        cos = cos.to(x.device)
+    if sin.device != x.device:
+        sin = sin.to(x.device)
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)

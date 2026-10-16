@@ -151,6 +151,10 @@ class CachedNAR:
                 x = x.to(layer_dev, non_blocking=True)
             cos_l = cos.to(layer_dev, non_blocking=True) if cos.device != layer_dev else cos
             sin_l = sin.to(layer_dev, non_blocking=True) if sin.device != layer_dev else sin
+            if cos_l.device != x.device:
+                cos_l = cos_l.to(x.device)
+            if sin_l.device != x.device:
+                sin_l = sin_l.to(x.device)
             q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos_l, sin_l)
             # Clone only for restricted visibility; a slice would retain the
             # storage of invisible codec tokens for every layer.
@@ -178,6 +182,10 @@ class CachedNAR:
                 x = x.to(layer_dev, non_blocking=True)
             cos_l = self.cos.to(layer_dev, non_blocking=True) if self.cos.device != layer_dev else self.cos
             sin_l = self.sin.to(layer_dev, non_blocking=True) if self.sin.device != layer_dev else self.sin
+            if cos_l.device != x.device:
+                cos_l = cos_l.to(x.device)
+            if sin_l.device != x.device:
+                sin_l = sin_l.to(x.device)
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), cos_l, sin_l)
             if ar_k.device != layer_dev:
                 ar_k = ar_k.to(layer_dev, non_blocking=True)

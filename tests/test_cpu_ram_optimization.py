@@ -422,6 +422,46 @@ class TestNonBlockingTransfers(unittest.TestCase):
             "_offload_ar must call torch.cuda.synchronize() after non_blocking transfers"
         )
 
+    def test_apply_rotary_device_guard(self):
+        """_apply_rotary must guard against mismatched cos/sin device."""
+        import inspect
+        from yue2.modeling_yue2 import _apply_rotary
+        source = inspect.getsource(_apply_rotary)
+        assert "if cos.device != x.device: cos = cos.to(x.device)" in source or (
+            "if cos.device != x.device:\n        cos = cos.to(x.device)" in source
+        )
+        assert "if sin.device != x.device: sin = sin.to(x.device)" in source or (
+            "if sin.device != x.device:\n        sin = sin.to(x.device)" in source
+        )
+        x = torch.randn(1, 4, 8, 16)
+        cos = torch.randn(1, 4, 1, 8)
+        sin = torch.randn(1, 4, 1, 8)
+        out = _apply_rotary(x, cos, sin)
+        assert out.shape == x.shape
+        assert out.device == x.device
+
+    def test_velocity_rotary_device_alignment(self):
+        """velocity must explicitly align cos_l and sin_l with x.device."""
+        import inspect
+        source = inspect.getsource(nar.CachedNAR.velocity)
+        assert "if cos_l.device != x.device: cos_l = cos_l.to(x.device)" in source or (
+            "if cos_l.device != x.device:\n                cos_l = cos_l.to(x.device)" in source
+        )
+        assert "if sin_l.device != x.device: sin_l = sin_l.to(x.device)" in source or (
+            "if sin_l.device != x.device:\n                sin_l = sin_l.to(x.device)" in source
+        )
+
+    def test_prefill_rotary_device_alignment(self):
+        """_prefill must explicitly align cos_l and sin_l with x.device."""
+        import inspect
+        source = inspect.getsource(nar.CachedNAR._prefill)
+        assert "if cos_l.device != x.device: cos_l = cos_l.to(x.device)" in source or (
+            "if cos_l.device != x.device:\n                cos_l = cos_l.to(x.device)" in source
+        )
+        assert "if sin_l.device != x.device: sin_l = sin_l.to(x.device)" in source or (
+            "if sin_l.device != x.device:\n                sin_l = sin_l.to(x.device)" in source
+        )
+
 
 # ===========================================================================
 # TEST 7: ATTENTION FUNCTION CORRECTNESS (REGRESSION)
