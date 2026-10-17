@@ -94,6 +94,7 @@ def _make_mock_pipe(device="cpu", memory_budget_gib=24):
         pipe.generation_config = GenerationConfig()
         pipe._model = None
         pipe._vae = None
+        pipe.vae_stream = None
         pipe.load_timing = {}
         pipe.weights = {"mot": "mock_hash", "vae": "mock_hash"}
         pipe.runtime_sha256 = "mock_sha256"
@@ -648,6 +649,57 @@ class TestSmartDeviceManagementAndRouting(unittest.TestCase):
 
 
 # ===========================================================================
+# TEST 11: SDPA KERNELS, VAE STREAM, AND DEFAULT QUANTIZATION (FP16)
+# ===========================================================================
+
+class TestSDPAAndVAEStreamOptimization(unittest.TestCase):
+    """Verify Stage 1 optimizations: SDPA kernel selection, VAE stream, and default FP16."""
+
+    def test_sdpa_kernel_prioritizes_efficient_and_math(self):
+        """attention() must prioritize EFFICIENT_ATTENTION and MATH on CUDA."""
+        import inspect
+        source = inspect.getsource(nar.attention)
+        assert "SDPBackend.EFFICIENT_ATTENTION" in source
+        assert "SDPBackend.MATH" in source
+        assert "block = 512 if total_gib < 18.0 else len(q)" in source
+
+    def test_quantization_default_is_none_resolving_to_none(self):
+        """quantization default must be None, resolving to 'none' (FP16/full precision)."""
+        pipe = _make_mock_pipe()
+        assert pipe.quantization == "none"
+
+        # Explicit None should resolve to 'none'
+        mock_props = MagicMock(total_memory=16 * (1024 ** 3), name="Tesla T4", major=7, minor=5)
+        with (
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.cuda.device_count", return_value=0),
+            patch.object(Path, "is_file", return_value=True),
+            patch("yue2.pipeline.model_identity", return_value="mock_hash"),
+            patch("yue2.pipeline.YuE2TextTokenizer", return_value=MagicMock()),
+        ):
+            p = YuE2Pipeline("/fake/model", "/fake/vae", device="cpu", quantization=None)
+            assert p.quantization == "none"
+
+    def test_vae_stream_in_pipeline_and_decode(self):
+        """YuE2Pipeline must define vae_stream and use it in decode()."""
+        import inspect
+        decode_source = inspect.getsource(YuE2Pipeline.decode)
+        assert "torch.cuda.stream(self.vae_stream)" in decode_source
+        assert "self.vae_stream.synchronize()" in decode_source
+
+        # On CPU, vae_stream is None
+        pipe = _make_mock_pipe()
+        assert pipe.vae_stream is None
+
+    def test_from_pretrained_accepts_quantization_parameter(self):
+        """from_pretrained must accept quantization parameter defaulting to None."""
+        import inspect
+        sig = inspect.signature(YuE2Pipeline.from_pretrained)
+        assert "quantization" in sig.parameters
+        assert sig.parameters["quantization"].default is None
+
+
+# ===========================================================================
 # RUNNER
 # ===========================================================================
 
@@ -672,6 +724,7 @@ if __name__ == "__main__":
             TestSongResultProperties,
             TestPipelineSourceStructure,
             TestSmartDeviceManagementAndRouting,
+            TestSDPAAndVAEStreamOptimization,
         ]:
             suite.addTests(loader.loadTestsFromTestCase(cls))
         runner = unittest.TextTestRunner(verbosity=2)

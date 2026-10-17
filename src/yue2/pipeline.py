@@ -133,13 +133,14 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=None, progress=True,
+                 vae_core_frames=None, quantization=None, offload_ar=None, progress=True,
                  multi_gpu=None):
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
         if backend not in {"torch", "torch-eager", "vllm"}:
             raise ValueError("backend must be torch, torch-eager, or vllm")
+        quantization = "none" if quantization is None else quantization
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
         if not 0 < memory_budget_gib:
@@ -160,6 +161,14 @@ class YuE2Pipeline:
             self.vae_device = torch.device(f"cuda:{gpu_count - 1}")
         else:
             self.vae_device = self.device
+        try:
+            self.vae_stream = (
+                torch.cuda.Stream(device=self.vae_device)
+                if (self.vae_device.type == "cuda" and torch.cuda.is_available() and torch.backends.cuda.is_built())
+                else None
+            )
+        except Exception:
+            self.vae_stream = None
         self.memory_budget_gib, self.offload_ar = self._auto_configure_kaggle_hardware(
             memory_budget_gib, offload_ar, gpu_count=gpu_count
         )
@@ -232,7 +241,8 @@ class YuE2Pipeline:
     @classmethod
     def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
                         revision=None, vae_revision=None, local_files_only=False,
-                        token=None, cache_dir=None, progress=True, multi_gpu=None, **kwargs):
+                        token=None, cache_dir=None, progress=True, multi_gpu=None,
+                        quantization=None, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
@@ -249,7 +259,8 @@ class YuE2Pipeline:
         with Progress(enabled=progress).stage("Resolving model files"):
             model_path = resolve_model(model, revision=revision, **hub)
             vae_path = resolve_model(vae, revision=vae_revision, **hub)
-        result = cls(model_path, vae_path, progress=progress, multi_gpu=multi_gpu, **kwargs)
+        result = cls(model_path, vae_path, progress=progress, multi_gpu=multi_gpu,
+                     quantization=quantization, **kwargs)
         result.load_timing["resolve_and_integrity_seconds"] = time.perf_counter() - start
         return result
 
@@ -383,6 +394,8 @@ class YuE2Pipeline:
         if self.backend == "vllm":
             from .fast import close_vllm
             close_vllm(self)
+        if self.vae_stream is not None:
+            self.vae_stream.synchronize()
         self._model, self._vae = None, None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
@@ -396,44 +409,50 @@ class YuE2Pipeline:
     def decode(self, latents, *, full=False, vae=None):
         from .modeling_vae import YuE2VAE
         target_device = self.vae_device
-        with self._status("Loading audio decoder"):
-            if not self.multi_gpu and self._model is not None:
-                self._model.to("cpu")
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-            if vae is not None:
-                model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=target_device)
-            else:
-                if self._vae is None:
-                    self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True, device=target_device,
-                                                        local_files_only=True)
-                model = self._vae.to(target_device)
-        z = torch.as_tensor(latents, dtype=torch.float32)
-        if z.ndim == 2 and z.shape[1] == 64:
-            z = z.T.unsqueeze(0)
-        if z.ndim != 3 or z.shape[0] != 1 or z.shape[1] != 64:
-            raise ValueError("Expected latents [T,64] or [1,64,T]")
-        try:
-            tiles = 1 if full else (z.shape[-1] + self.vae_core_frames - 1) // self.vae_core_frames
-            with self._status("Decoding audio", total=tiles, unit="chunks") as status:
-                report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
-                with torch.inference_mode():
-                    if full:
-                        audio = model.decode(z.to(target_device)).cpu()
-                        status.update(1)
-                    else:
-                        audio = model.decode_tiled(z.to(target_device), core_frames=self.vae_core_frames, halo_frames=16,
-                                                   output_device="cpu", on_progress=report)
-                if not torch.isfinite(audio).all():
-                    raise ValueError("VAE produced non-finite audio")
-                return audio[0].float().clamp(-1, 1).T.contiguous().numpy()
-        finally:
-            if not self.multi_gpu:
-                model.to("cpu")
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-            # Free VAE host memory after decode completes
-            gc.collect()
+        stream_ctx = torch.cuda.stream(self.vae_stream) if self.vae_stream is not None else nullcontext()
+        with stream_ctx:
+            with self._status("Loading audio decoder"):
+                if not self.multi_gpu and self._model is not None:
+                    self._model.to("cpu")
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if vae is not None:
+                    model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=target_device)
+                else:
+                    if self._vae is None:
+                        self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True, device=target_device,
+                                                            local_files_only=True)
+                    model = self._vae.to(target_device)
+            z = torch.as_tensor(latents, dtype=torch.float32)
+            if z.ndim == 2 and z.shape[1] == 64:
+                z = z.T.unsqueeze(0)
+            if z.ndim != 3 or z.shape[0] != 1 or z.shape[1] != 64:
+                raise ValueError("Expected latents [T,64] or [1,64,T]")
+            try:
+                tiles = 1 if full else (z.shape[-1] + self.vae_core_frames - 1) // self.vae_core_frames
+                with self._status("Decoding audio", total=tiles, unit="chunks") as status:
+                    report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
+                    with torch.inference_mode():
+                        if full:
+                            audio = model.decode(z.to(target_device)).cpu()
+                            status.update(1)
+                        else:
+                            audio = model.decode_tiled(z.to(target_device), core_frames=self.vae_core_frames, halo_frames=16,
+                                                       output_device="cpu", on_progress=report)
+                    if not torch.isfinite(audio).all():
+                        raise ValueError("VAE produced non-finite audio")
+                    if self.vae_stream is not None:
+                        self.vae_stream.synchronize()
+                    return audio[0].float().clamp(-1, 1).T.contiguous().numpy()
+            finally:
+                if self.vae_stream is not None:
+                    self.vae_stream.synchronize()
+                if not self.multi_gpu:
+                    model.to("cpu")
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                # Free VAE host memory after decode completes
+                gc.collect()
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
         config = self.generation_config.to_dict()

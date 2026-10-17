@@ -86,9 +86,24 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
         key, value = key.repeat_interleave(groups, 1), value.repeat_interleave(groups, 1)
         grouped = False
     context = nullcontext()
-    if backend != "sdpa":
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-        context = sdpa_kernel(SDPBackend.MATH if backend == "math" else SDPBackend.FLASH_ATTENTION)
+    if q.device.type == "cuda":
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            if backend == "math":
+                context = sdpa_kernel([SDPBackend.MATH])
+            elif backend == "flash":
+                context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+            else:
+                # Default SDPA on NVIDIA T4 (and general GPUs): prioritize EFFICIENT_ATTENTION and MATH
+                context = sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+        except Exception:
+            context = nullcontext()
+    elif backend != "sdpa":
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            context = sdpa_kernel(SDPBackend.MATH if backend == "math" else SDPBackend.FLASH_ATTENTION)
+        except Exception:
+            context = nullcontext()
     outputs = []
     with context:
         for start in range(0, len(q), block):
