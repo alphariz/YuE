@@ -16,7 +16,9 @@ class Tokenizer:
 def test_defaults_and_native_instructions():
     cfg = GenerationConfig()
     assert cfg.abc == Sampling(.7, .9, 30, 1.005, 100, 32, 4096)
-    assert cfg.semantic == Sampling(1., .95, 100, 1.2, 50, 200, 9000)
+    assert cfg.semantic == Sampling(1., .95, 100, 1.2, 50, 200, 15000)
+    assert cfg.max_semantic_tokens == 15000
+    assert DEFAULT_MAX_SEMANTIC_TOKENS == 15000
     assert (cfg.ode_steps, cfg.ode_method, cfg.context) == (32, "midpoint", 24576)
     assert SongRequest("piano", "line\nline").cot == "full"
     assert "chord-annotated" in SongRequest("a", "b").text()
@@ -110,3 +112,34 @@ def test_saved_plan_preserves_exact_ids_and_rejects_edits(tmp_path):
         SymbolicPlan.load(tmp_path)
     with pytest.raises(ValueError, match="ordinary"):
         token_prefixes(request, Tokenizer(), [ABC_END])
+
+
+def test_dynamic_max_semantic_tokens():
+    # Direct init with max_semantic_tokens
+    cfg1 = GenerationConfig(max_semantic_tokens=12000)
+    assert cfg1.max_semantic_tokens == 12000
+    assert cfg1.semantic.max_tokens == 12000
+
+    # from_dict with max_semantic_tokens
+    cfg2 = GenerationConfig.from_dict({"max_semantic_tokens": 10500})
+    assert cfg2.max_semantic_tokens == 10500
+    assert cfg2.semantic.max_tokens == 10500
+
+    # from_dict with semantic dict
+    cfg3 = GenerationConfig.from_dict({"semantic": {"max_tokens": 8000}})
+    assert cfg3.max_semantic_tokens == 8000
+    assert cfg3.semantic.max_tokens == 8000
+
+    # with_max_semantic_tokens method
+    cfg4 = GenerationConfig().with_max_semantic_tokens(7500)
+    assert cfg4.max_semantic_tokens == 7500
+    assert cfg4.semantic.max_tokens == 7500
+
+    # request_kwargs processing
+    req1 = request_kwargs({"tags": "pop", "lyrics": "hello", "max_semantic_tokens": 14000})
+    assert req1["semantic_sampling"] == {"max_tokens": 14000}
+    assert "max_semantic_tokens" not in req1
+
+    req2 = request_kwargs({"tags": "pop", "lyrics": "hello", "max_tokens": 13000})
+    assert req2["semantic_sampling"] == {"max_tokens": 13000}
+    assert "max_tokens" not in req2

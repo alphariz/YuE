@@ -12,4 +12,7 @@ def __getattr__(name):
     if name in {"YuE2VAE", "YuE2VAEConfig"}:
         from . import modeling_vae
         return getattr(modeling_vae, name)
+    if name in {"GenerationConfig", "Sampling", "SongRequest", "DEFAULT_MAX_SEMANTIC_TOKENS"}:
+        from . import protocol
+        return getattr(protocol, name)
     raise AttributeError(name)

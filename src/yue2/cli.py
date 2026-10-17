@@ -39,12 +39,25 @@ def get_pipe(args):
 
 
 def request_kwargs(data, base=Path.cwd()):
-    allowed = {"style", "tags", "lyrics", "cot", "seed", "abc", "cfg_scale", "id", "abc_sampling", "semantic_sampling"}
+    allowed = {"style", "tags", "lyrics", "cot", "seed", "abc", "cfg_scale", "id", "abc_sampling", "semantic_sampling", "max_semantic_tokens", "max_tokens"}
     metadata = {"lang", "eval_index", "clip_id", "prompt"}
     unknown = set(data) - allowed - metadata - {"abc_path"}
     if unknown:
         raise ValueError(f"Unknown request fields: {sorted(unknown)}")
     result = {k: v for k, v in data.items() if k in allowed}
+    if "max_semantic_tokens" in result or "max_tokens" in result:
+        max_sem = result.pop("max_semantic_tokens", None)
+        if max_sem is None:
+            max_sem = result.pop("max_tokens", None)
+        else:
+            result.pop("max_tokens", None)
+        if "semantic_sampling" not in result:
+            result["semantic_sampling"] = {"max_tokens": int(max_sem)}
+        elif isinstance(result["semantic_sampling"], dict):
+            result["semantic_sampling"] = {**result["semantic_sampling"], "max_tokens": int(max_sem)}
+        elif hasattr(result["semantic_sampling"], "max_tokens"):
+            import dataclasses
+            result["semantic_sampling"] = dataclasses.replace(result["semantic_sampling"], max_tokens=int(max_sem))
     if "abc_path" in data:
         if data.get("abc") is not None:
             raise ValueError("Pass abc or abc_path, not both")
@@ -94,8 +107,8 @@ def generate(args):
         base = path.parent
     else:
         data, base = {}, Path.cwd()
-    for key in ("id", "style", "cot", "seed", "cfg_scale"):
-        value = getattr(args, key)
+    for key in ("id", "style", "cot", "seed", "cfg_scale", "max_semantic_tokens"):
+        value = getattr(args, key, None)
         if value is not None:
             data[key] = value
     if args.lyrics_file:
@@ -206,6 +219,8 @@ def parser():
             q.add_argument("--verify-hashes", action="store_true")
         else:
             q.add_argument("--cot", choices=("full", "melody", "off"))
+            q.add_argument("--max-semantic-tokens", "--max-tokens", dest="max_semantic_tokens", type=int,
+                           help="Maximum semantic tokens (default: 15000)")
             q.add_argument("--resume", action="store_true")
             q.add_argument("--quiet", "--no-progress", action="store_true",
                            help="Hide YuE2 progress on stderr; keep result output on stdout")

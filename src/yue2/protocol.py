@@ -1,6 +1,7 @@
 """Versioned, checkpoint-native prompting and generation defaults."""
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+import dataclasses
+from dataclasses import dataclass, field, asdict, replace
 import math
 import re
 
@@ -18,6 +19,9 @@ INSTRUCTIONS = {
 }
 
 
+DEFAULT_MAX_SEMANTIC_TOKENS = 15000
+
+
 @dataclass(frozen=True)
 class Sampling:
     temperature: float = 1.0
@@ -26,7 +30,7 @@ class Sampling:
     repetition_penalty: float = 1.2
     penalty_window: int = 50
     min_tokens: int = 200
-    max_tokens: int = 9000
+    max_tokens: int = DEFAULT_MAX_SEMANTIC_TOKENS
 
     def __post_init__(self):
         if any(type(x) is not int for x in (self.top_k, self.penalty_window, self.min_tokens, self.max_tokens)):
@@ -50,9 +54,56 @@ class GenerationConfig:
     context: int = CONTEXT
     version: str = PROTOCOL_VERSION
 
+    def __init__(
+        self,
+        abc: Sampling | dict | None = None,
+        semantic: Sampling | dict | None = None,
+        ode_steps: int = 32,
+        ode_method: str = "midpoint",
+        context: int = CONTEXT,
+        version: str = PROTOCOL_VERSION,
+        *,
+        max_semantic_tokens: int | None = None,
+    ):
+        if abc is None:
+            abc = Sampling(.7, .9, 30, 1.005, 100, 32, 4096)
+        elif isinstance(abc, dict):
+            abc = resolve_sampling(abc, Sampling(.7, .9, 30, 1.005, 100, 32, 4096))
+        elif not isinstance(abc, Sampling):
+            raise TypeError("abc must be a Sampling object or dict")
+
+        if semantic is None:
+            semantic = Sampling(max_tokens=max_semantic_tokens) if max_semantic_tokens is not None else Sampling()
+        elif isinstance(semantic, dict):
+            sem_dict = dict(semantic)
+            if max_semantic_tokens is not None:
+                sem_dict["max_tokens"] = max_semantic_tokens
+            semantic = resolve_sampling(sem_dict, Sampling())
+        elif isinstance(semantic, Sampling):
+            if max_semantic_tokens is not None:
+                semantic = dataclasses.replace(semantic, max_tokens=max_semantic_tokens)
+        else:
+            raise TypeError("semantic must be a Sampling object or dict")
+
+        object.__setattr__(self, "abc", abc)
+        object.__setattr__(self, "semantic", semantic)
+        object.__setattr__(self, "ode_steps", ode_steps)
+        object.__setattr__(self, "ode_method", ode_method)
+        object.__setattr__(self, "context", context)
+        object.__setattr__(self, "version", version)
+
+        self.__post_init__()
+
     def __post_init__(self):
         if self.context != CONTEXT or self.ode_method != "midpoint" or type(self.ode_steps) is not int or self.ode_steps < 1:
             raise ValueError("Require context=24576 and midpoint with positive integer steps")
+
+    @property
+    def max_semantic_tokens(self) -> int:
+        return self.semantic.max_tokens
+
+    def with_max_semantic_tokens(self, max_tokens: int) -> GenerationConfig:
+        return dataclasses.replace(self, semantic=dataclasses.replace(self.semantic, max_tokens=max_tokens))
 
     def to_dict(self):
         return asdict(self)
@@ -61,10 +112,14 @@ class GenerationConfig:
     def from_dict(cls, data):
         value = dict(data)
         defaults = cls()
+        max_sem = value.pop("max_semantic_tokens", None)
         for key in ("abc", "semantic"):
             if key in value and isinstance(value[key], dict):
                 value[key] = Sampling(**{**asdict(getattr(defaults, key)), **value[key]})
-        return cls(**value)
+        cfg = cls(**value)
+        if max_sem is not None:
+            cfg = cfg.with_max_semantic_tokens(max_sem)
+        return cfg
 
 
 def resolve_sampling(value, default):

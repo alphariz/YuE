@@ -355,13 +355,20 @@ class YuE2Pipeline:
         return SymbolicPlan(request, self.tokenizer.decode(ids), ids,
                             token_prefixes(request, self.tokenizer, ids), timing, truncated)
 
-    def generate_semantic(self, plan, *, sampling=None, cancelled=None, on_token=None):
+    def generate_semantic(self, plan, *, sampling=None, max_semantic_tokens=None, cancelled=None, on_token=None):
         if not isinstance(plan, SymbolicPlan):
             raise TypeError("Pass the SymbolicPlan returned by pipe.plan()")
         request = plan.request
         expected = token_prefixes(request, self.tokenizer, plan.abc_ids)
         if expected != plan.prefix:
             raise ValueError("Plan prefix disagrees with request/exact ABC IDs")
+        if max_semantic_tokens is not None:
+            if sampling is None:
+                sampling = dataclasses.replace(self.generation_config.semantic, max_tokens=max_semantic_tokens)
+            elif isinstance(sampling, dict):
+                sampling = {**sampling, "max_tokens": max_semantic_tokens}
+            elif isinstance(sampling, Sampling):
+                sampling = dataclasses.replace(sampling, max_tokens=max_semantic_tokens)
         sampling = resolve_sampling(sampling, self.generation_config.semantic)
         negative = negative_prefix(request, self.tokenizer, plan.abc_ids) if request.guidance != 1 else None
         ids, timing, truncated = self._generate(plan.prefix, sampling, request.seed, "semantic",
@@ -454,7 +461,14 @@ class YuE2Pipeline:
                 # Free VAE host memory after decode completes
                 gc.collect()
 
-    def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
+    def effective_config(self, request, abc_sampling=None, semantic_sampling=None, max_semantic_tokens=None):
+        if max_semantic_tokens is not None:
+            if semantic_sampling is None:
+                semantic_sampling = {"max_tokens": max_semantic_tokens}
+            elif isinstance(semantic_sampling, dict):
+                semantic_sampling = {**semantic_sampling, "max_tokens": max_semantic_tokens}
+            elif isinstance(semantic_sampling, Sampling):
+                semantic_sampling = dataclasses.replace(semantic_sampling, max_tokens=max_semantic_tokens)
         config = self.generation_config.to_dict()
         for key, sampling in (("abc", abc_sampling), ("semantic", semantic_sampling)):
             if sampling is not None:
@@ -476,7 +490,14 @@ class YuE2Pipeline:
                 "validation_status": "unvalidated"}
 
     def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
-                 semantic_sampling=None, cancelled=None, on_token=None, **kwargs):
+                 semantic_sampling=None, max_semantic_tokens=None, cancelled=None, on_token=None, **kwargs):
+        if max_semantic_tokens is not None:
+            if semantic_sampling is None:
+                semantic_sampling = {"max_tokens": max_semantic_tokens}
+            elif isinstance(semantic_sampling, dict):
+                semantic_sampling = {**semantic_sampling, "max_tokens": max_semantic_tokens}
+            elif isinstance(semantic_sampling, Sampling):
+                semantic_sampling = dataclasses.replace(semantic_sampling, max_tokens=max_semantic_tokens)
         request = self._request(style, lyrics, tags=tags, **kwargs)
         config = self.effective_config(request, abc_sampling, semantic_sampling)
         request_id = identity({"request": request.to_dict(), "config": config, "weights": self.weights})
